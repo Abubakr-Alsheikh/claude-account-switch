@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-account-switch"
+version = "0.1.0"
+description = "Switch the account Claude Code uses with one command, keeping one shared history. Saves each login safely despite single-use refresh tokens."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Abubakr Alsheikh", email = "abubakr.alsheikh@outlook.com" }]
+maintainers = [{ name = "Abubakr Alsheikh", email = "abubakr.alsheikh@outlook.com" }]
+keywords = ["claude", "claude-code", "accounts", "cli", "oauth"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Topic :: Utilities",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Abubakr-Alsheikh/claude-account-switch"
+Issues = "https://github.com/Abubakr-Alsheikh/claude-account-switch/issues"
+
+[project.scripts]
+claude-switch = "claude_switch:entry"
+
+[tool.setuptools]
+py-modules = ["claude_switch"]
