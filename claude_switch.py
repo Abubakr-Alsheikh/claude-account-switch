@@ -36,7 +36,7 @@ import time
 import urllib.error
 import urllib.request
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 PROG = "claude-switch"
 ISSUES = "https://github.com/Abubakr-Alsheikh/claude-account-switch/issues"
 
@@ -465,15 +465,21 @@ def is_live(name):
     return live_name() == name or (saved(name) and fp == fingerprint(slot_data(name)))
 
 
+PLAN_NAMES = (("20x", "Ultra"), ("5x", "Max"))  # rate-limit tier -> plan name Anthropic shows (Nov 2026)
+
+
 def plan_of(name):
-    acct = read_json(slot(name, "account"), {})
-    if isinstance(acct, dict) and acct.get("planDisplayName"):
+    """The plan name Claude Code records (planDisplayName), else one read from the login's rate-limit tier."""
+    acct = read_dict(slot(name, "account"))
+    if isinstance(acct.get("planDisplayName"), str) and acct["planDisplayName"]:
         return acct["planDisplayName"]
     o = oauth(live_data() if is_live(name) else slot_data(name))
-    sub, tier = o.get("subscriptionType") or "", o.get("rateLimitTier") or ""
-    for mult in ("20x", "5x"):
-        if mult in tier:
-            return f"{sub.capitalize() or 'Max'} {mult}"
+    sub, tier = str(o.get("subscriptionType") or ""), str(o.get("rateLimitTier") or "")
+    if "ultra" in tier.lower() or sub.lower() == "ultra":
+        return "Ultra"
+    for mark, plan in PLAN_NAMES:
+        if mark in tier:
+            return plan
     return sub.capitalize() or "?"
 
 

@@ -9,8 +9,8 @@ CLAUDE ACCOUNTS   active: work (me@work.example)
 
    name          email                     plan     weekly use (resets)         5-hour use (resets)    renewed      ends
    ------------  ------------------------  -------  --------------------------  ---------------------  -----------  -----
->> work          me@work.example           Max 20x  #######...  71%  Sun 09:00  ###...  48%     17:00  10-30 12:10  11-24
-   personal      me@home.example           Max 5x   ##........  18%  Tue 21:00  ......   0%     19:40  10-30 09:02  11-19
+>> work          me@work.example           Ultra    #######...  71%  Sun 09:00  ###...  48%     17:00  10-30 12:10  11-24
+   personal      me@home.example           Max      ##........  18%  Tue 21:00  ......   0%     19:40  10-30 09:02  11-19
 
 Most weekly room: personal (18% used)  ->  claude-switch use personal  or  claude-switch auto
 Commands: claude-switch use NAME | auto | add NAME | save NAME | sync | refresh | help
@@ -87,7 +87,7 @@ else in `~/.claude.json`, so projects, history and settings stay shared.
 Python 3.9 or newer.
 
 ```
-pipx install git+https://github.com/Abubakr-Alsheikh/claude-account-switch@v0.2.0
+pipx install git+https://github.com/Abubakr-Alsheikh/claude-account-switch@v0.2.1
 ```
 
 The PyPI package named `claude-switch` is a different project. Install from GitHub as shown.

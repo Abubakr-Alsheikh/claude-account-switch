@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1 (2026-11-02)
+
+- Plan names follow Anthropic's November 2026 renaming: the 20x tier shows as Ultra and the 5x tier as Max. The
+  name Claude Code records for an account (`planDisplayName`) still comes first.
+
 ## 0.2.0 (2026-11-02)
 
 Fixes from a review of 0.1.0 before its first tagged release.

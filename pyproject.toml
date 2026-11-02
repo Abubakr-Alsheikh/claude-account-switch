@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-account-switch"
-version = "0.2.0"
+version = "0.2.1"
 description = "Switch the account Claude Code uses with one command, keeping one shared history. Unofficial."
 readme = "README.md"
 requires-python = ">=3.9"

@@ -476,6 +476,24 @@ class ReviewFixTest(unittest.TestCase):
         wjson(p.state, st)
         p.run("save", "alpha")
 
+    def test_plan_names(self):
+        """Anthropic's names since November 2026: the 20x tier is Ultra, the 5x tier is Max."""
+        p = self.two_accounts()
+        c = rjson(p.slot("alpha"))
+        c["claudeAiOauth"]["rateLimitTier"] = "default_claude_max_5x"
+        wjson(p.slot("alpha"), c)
+        out, _ = p.run("list")
+        # Table rows start with ">> " (active) or "   ", then the account name.
+        rows = {line[3:].split()[0]: line for line in out.splitlines() if line[3:].split()[:1] in (["alpha"], ["beta"])}
+        self.assertIn(" Max ", rows["alpha"], out)
+        self.assertIn(" Ultra ", rows["beta"], out)
+        self.assertNotIn("20x", out)
+        acct = rjson(os.path.join(p.store, "beta.account.json"))
+        acct["planDisplayName"] = "Team Premium"
+        wjson(os.path.join(p.store, "beta.account.json"), acct)
+        out, _ = p.run("list")
+        self.assertIn("Team Pr", out, "the name Claude Code records wins")
+
     def test_names_that_differ_only_in_case_are_refused(self):
         p = self.p
         p.login(EMAILS["alpha"])
