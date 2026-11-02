@@ -1,6 +1,6 @@
 """A stand-in for macOS /usr/bin/security, enough for claude_switch's Keychain backend.
 
-Items live in $CLAUDE_SWITCH_HOME/fake-keychain.json as {"service|account": "value"}.
+Items live in $CLAUDE_SWITCH_TEST_HOME/fake-keychain.json as {"service|account": "value"}.
 Supports find-generic-password (-w), add-generic-password -U -X, delete-generic-password, and `-i` (commands on stdin).
 FAKE_SECURITY_FAIL=<exit code> makes every call fail with that code (a locked Keychain is 36 or 51).
 """
@@ -9,7 +9,7 @@ import os
 import shlex
 import sys
 
-DB = os.path.join(os.environ["CLAUDE_SWITCH_HOME"], "fake-keychain.json")
+DB = os.path.join(os.environ["CLAUDE_SWITCH_TEST_HOME"], "fake-keychain.json")
 NOT_FOUND = 44
 
 

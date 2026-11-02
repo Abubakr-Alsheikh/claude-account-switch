@@ -11,20 +11,21 @@ claude-switch saves the active account's newest login on every command, holds Cl
 swaps, refuses to file one account's login under another name, keeps the last 3 copies of each account, and marks
 a saved login dead when the server answers invalid_grant.
 
-Opt-in only: `refresh`, `keepalive` and `auto --refresh` renew the saved logins of accounts you are not using, with
-the same request Claude Code sends (POST https://platform.claude.com/v1/oauth/token). Nothing runs on a schedule
-unless you set that up yourself. Usage readings come from GET https://api.anthropic.com/api/oauth/usage, the
-read-only endpoint behind Claude Code's /usage screen.
+Opt-in only: `refresh`, `keepalive` and `auto --refresh` renew the saved logins of accounts you are not using, at
+the endpoint and with the fields Claude Code uses (POST https://platform.claude.com/v1/oauth/token), identified as
+claude-switch. Nothing runs on a schedule unless you set that up yourself. Usage readings come from
+GET https://api.anthropic.com/api/oauth/usage, the read-only endpoint behind Claude Code's /usage screen.
 
 No token is ever printed or logged; logins are compared by a SHA-256 hash of the refresh token.
 
-Testing: set CLAUDE_SWITCH_HOME to a fake home folder. The script then never touches the real profile, and only
-then may CLAUDE_SWITCH_TOKEN_URL, CLAUDE_SWITCH_USAGE_URL, CLAUDE_SWITCH_BACKEND (file | keychain) and
-CLAUDE_SWITCH_SECURITY (a stand-in for /usr/bin/security) point at fakes.
+Testing: set CLAUDE_SWITCH_TEST_HOME to a fake home folder. The script then never touches the real profile and uses
+the file backend. Only then may CLAUDE_SWITCH_TOKEN_URL, CLAUDE_SWITCH_USAGE_URL, CLAUDE_SWITCH_BACKEND
+(file | keychain) and CLAUDE_SWITCH_SECURITY (a stand-in for /usr/bin/security, required for keychain) point at fakes.
 """
+import contextlib
 import datetime
-import glob
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -35,14 +36,18 @@ import time
 import urllib.error
 import urllib.request
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 PROG = "claude-switch"
+ISSUES = "https://github.com/Abubakr-Alsheikh/claude-account-switch/issues"
 
-TEST_HOME = os.environ.get("CLAUDE_SWITCH_HOME", "")
+TEST_HOME = os.environ.get("CLAUDE_SWITCH_TEST_HOME", "")
 HOME = TEST_HOME or os.path.expanduser("~")
 CLAUDE_DIR = os.path.join(HOME, ".claude")
 CREDS = os.path.join(CLAUDE_DIR, ".credentials.json")
-CLAUDE_LOCK = os.path.join(CLAUDE_DIR, ".oauth_refresh.lock")  # Claude Code's own refresh lock (a directory)
+# Claude Code's own locks, all mkdir-style directories (proper-lockfile), as of Claude Code 2.1.316:
+CLAUDE_LOCK = os.path.join(CLAUDE_DIR, ".oauth_refresh.lock")  # token renewal, taken first
+CLAUDE_LEGACY_LOCK = os.path.join(HOME, ".claude.lock")        # older token renewal lock, taken second
+STORAGE_LOCK = os.path.join(CLAUDE_DIR, ".storage-write.lock")  # every write of the saved login
 STATE = os.path.join(HOME, ".claude.json")
 STATE_LOCK = STATE + ".lock"  # Claude Code's lock for .claude.json (a directory)
 STORE = os.path.join(HOME, ".claude-switch")
@@ -72,6 +77,7 @@ CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"  # Claude Code's public OAuth
 DEFAULT_SCOPES = ["user:profile", "user:inference", "user:sessions:claude_code", "user:mcp_servers",
                   "user:file_upload"]
 KEYCHAIN_SERVICE = "Claude Code-credentials"
+KEYCHAIN_ACCOUNT = "claude-code-user"  # the Keychain account Claude Code 2.1.x uses; older versions used $USER
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
 
 ACCTS = {}  # name -> email ("" until the first save), loaded from accounts.json
@@ -104,18 +110,46 @@ def read_json(path, default=None, strict=False):
         return {} if default is None else default
 
 
+def read_dict(path, strict=False):
+    """A JSON object from `path`, or {}. With `strict`, a file that holds anything else stops the command."""
+    data = read_json(path, {}, strict=strict)
+    if isinstance(data, dict):
+        return data
+    if strict:
+        raise Fail(f"{path} must hold a JSON object; fix or restore it, then try again")
+    return {}
+
+
 def write_text_atomic(path, text, private=True):
-    """Write through a temp file and rename. Private files get mode 0600; others keep the old file's mode."""
-    tmp = path + ".switch-tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(text)
-    if not private and os.path.exists(path):
-        try:
-            shutil.copymode(path, tmp)
-        except OSError:
-            pass
-    os.replace(tmp, path)
+    """
+    Write a temp file of our own, flush it to disk, then rename it over `path`, so a crash never leaves a
+    half-written login. Private files get mode 0600; others keep the old file's mode. The temp file is removed
+    on any error, because it may hold a login.
+    """
+    tmp = f"{path}.{os.getpid()}-{time.monotonic_ns()}.switch-tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if not private and os.path.exists(path):
+            try:
+                shutil.copymode(path, tmp)
+            except OSError:
+                pass
+        for attempt in range(5):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:  # Windows: another process has `path` open for a moment
+                if attempt == 4:
+                    raise
+                time.sleep(0.1)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+        raise
 
 
 def write_json_atomic(path, data, private=True):
@@ -136,7 +170,8 @@ def make_private_dir(path):
 
 
 def stamp():
-    return time.strftime("%Y%m%d-%H%M%S")
+    """Local time down to the microsecond, so two copies made in one second keep separate names."""
+    return datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
 
 
 def slot(name, kind):  # kind: credentials | account
@@ -184,6 +219,14 @@ def check_name(name):
                    f"a letter or digit")
 
 
+def check_case(name):
+    """Windows and macOS ignore case in file names, so `work` and `Work` would share one saved login."""
+    clash = next((n for n in ACCTS if n != name and n.lower() == name.lower()), "")
+    if clash:
+        raise Fail(f"{name!r} differs from the saved account {clash!r} only in case. On Windows and macOS both "
+                   f"would share one file. Use {clash!r} or another name.")
+
+
 def known(name):
     if name not in ACCTS:
         listed = " ".join(ACCTS) or "none yet"
@@ -220,10 +263,11 @@ class KeychainStore:
     STDIN_LIMIT = 4096 - 64  # `security -i` reads stdin lines into a 4096-byte buffer
 
     def __init__(self):
-        self.exe = "/usr/bin/security"
-        if TEST_HOME and os.environ.get("CLAUDE_SWITCH_SECURITY"):
-            self.exe = os.environ["CLAUDE_SWITCH_SECURITY"]
-        self.account = os.environ.get("USER") or self._os_user()
+        self.exe = os.environ["CLAUDE_SWITCH_SECURITY"] if TEST_HOME else "/usr/bin/security"
+        user = os.environ.get("USER") or self._os_user()
+        # Claude Code 2.1.x files the item under a fixed account; older versions used the login name.
+        self.accounts = [KEYCHAIN_ACCOUNT] + ([user] if user and user != KEYCHAIN_ACCOUNT else [])
+        self.account = None  # the account the item was found under, once read
         self._memo = None
 
     @staticmethod
@@ -232,7 +276,7 @@ class KeychainStore:
             import pwd
             return pwd.getpwuid(os.geteuid()).pw_name
         except (ImportError, KeyError, AttributeError):
-            return "claude-code-user"
+            return ""
 
     def _run(self, args, stdin=None):
         cmd = ([sys.executable, self.exe] if self.exe.endswith(".py") else [self.exe]) + args
@@ -244,37 +288,48 @@ class KeychainStore:
         except OSError as exc:
             raise Fail(f"cannot run {self.exe}: {exc}")
 
-    def _base(self):
-        return ["-a", self.account, "-s", KEYCHAIN_SERVICE]
+    def _base(self, account):
+        return ["-a", account, "-s", KEYCHAIN_SERVICE]
 
     def read(self, fresh=False):
         if self._memo is not None and not fresh:
             return self._memo
-        p = self._run(["find-generic-password", "-a", self.account, "-w", "-s", KEYCHAIN_SERVICE])
-        if p.returncode == 0:
+        text = None
+        for account in self.accounts:
+            p = self._run(["find-generic-password", "-a", account, "-w", "-s", KEYCHAIN_SERVICE])
+            if p.returncode == self.NOT_FOUND:
+                continue
+            if p.returncode != 0:
+                raise Fail(f"could not read the login from the macOS Keychain (security exit {p.returncode}: "
+                           f"{p.stderr.strip()[:120]}). Unlock the login keychain and try again.")
             text = p.stdout[:-1] if p.stdout.endswith("\n") else p.stdout
             if text and text[0] != "{" and re.fullmatch(r"[0-9a-fA-F]+", text):
                 try:  # `security -w` prints data with non-printable bytes as hex
                     text = bytes.fromhex(text).decode("utf-8")
                 except ValueError:
                     pass
-        elif p.returncode == self.NOT_FOUND:
-            text = read_text(CREDS)  # Claude Code's own fallback
+            self.account = account
+            break
         else:
-            raise Fail(f"could not read the login from the macOS Keychain (security exit {p.returncode}: "
-                       f"{p.stderr.strip()[:120]}). Unlock the login keychain and try again.")
+            text = read_text(CREDS)  # Claude Code's own fallback when no item exists
         self._memo = text
         return text
 
     def write(self, text):
+        if self.account is None:
+            self.read(fresh=True)
+        account = self.account or KEYCHAIN_ACCOUNT
         self._memo = None
         hexed = text.encode("utf-8").hex()
-        line = (f'add-generic-password -U -a "{self._q(self.account)}" -s "{self._q(KEYCHAIN_SERVICE)}" '
+        line = (f'add-generic-password -U -a "{self._q(account)}" -s "{self._q(KEYCHAIN_SERVICE)}" '
                 f'-X {hexed}\n')
         if len(line.encode("utf-8")) <= self.STDIN_LIMIT:
             p = self._run(["-i"], stdin=line)  # keeps the secret out of the process list
         else:
-            p = self._run(["add-generic-password", "-U"] + self._base() + ["-X", hexed])
+            # Too long for `security -i` (a login with many MCP servers): the hex goes on the command line,
+            # where other users of this Mac can see it in the process list for a moment. Claude Code does the same.
+            p = self._run(["add-generic-password", "-U"] + self._base(account) + ["-X", hexed])
+        self.account = account
         back = self.read(fresh=True)
         if p.returncode != 0 or fingerprint(parse(back)) != fingerprint(parse(text)):
             raise Fail(f"writing the macOS Keychain item {KEYCHAIN_SERVICE!r} failed (security exit "
@@ -289,18 +344,24 @@ class KeychainStore:
 
     def remove(self):
         self._memo = None
-        p = self._run(["delete-generic-password"] + self._base())
-        if p.returncode not in (0, self.NOT_FOUND):
-            raise Fail(f"could not delete the macOS Keychain item (security exit {p.returncode})")
+        for account in self.accounts:
+            p = self._run(["delete-generic-password"] + self._base(account))
+            if p.returncode not in (0, self.NOT_FOUND):
+                raise Fail(f"could not delete the macOS Keychain item (security exit {p.returncode})")
+        self.account = None
         if os.path.exists(CREDS):
             os.remove(CREDS)
 
 
 def pick_store():
-    choice = os.environ.get("CLAUDE_SWITCH_BACKEND", "") if TEST_HOME else ""
-    if choice == "keychain" or (not choice and sys.platform == "darwin"):
+    if TEST_HOME:  # tests: the file backend unless they bring a fake `security` tool
+        if os.environ.get("CLAUDE_SWITCH_BACKEND", "file") != "keychain":
+            return FileStore()
+        if not os.environ.get("CLAUDE_SWITCH_SECURITY"):
+            raise Fail("CLAUDE_SWITCH_BACKEND=keychain under a test home needs CLAUDE_SWITCH_SECURITY "
+                       "(a fake security tool); the real Keychain is never used in tests")
         return KeychainStore()
-    return FileStore()
+    return KeychainStore() if sys.platform == "darwin" else FileStore()
 
 
 LIVE = None  # set in main()
@@ -342,8 +403,9 @@ def when(ms, fmt="%m-%d %H:%M"):
 
 
 def current_email():
-    acct = read_json(STATE, {}).get("oauthAccount") if os.path.exists(STATE) else None
-    return (acct or {}).get("emailAddress", "") if isinstance(acct, dict) else ""
+    acct = read_dict(STATE).get("oauthAccount") if os.path.exists(STATE) else None
+    email = acct.get("emailAddress", "") if isinstance(acct, dict) else ""
+    return email if isinstance(email, str) else ""
 
 
 def active():
@@ -355,22 +417,28 @@ def set_active(name):
 
 
 def meta():
-    return read_json(META, {})
+    return read_dict(META)
+
+
+def meta_of(name, m=None):
+    rec = (meta() if m is None else m).get(name)
+    return rec if isinstance(rec, dict) else {}
 
 
 def set_meta(name, **kw):
     m = meta()
-    m.setdefault(name, {}).update(kw)
+    m[name] = {**meta_of(name, m), **kw}
     write_json_atomic(META, m)
 
 
 def refreshed_at(name, data):
     """When this login was last renewed: our own record, else expiresAt minus the access token lifetime."""
-    rec = meta().get(name, {})
-    if rec.get("refreshed_at") and rec.get("fp") == fingerprint(data)[:16]:
-        return rec["refreshed_at"] * 1000
+    rec = meta_of(name)
+    at = rec.get("refreshed_at")
+    if isinstance(at, (int, float)) and at and rec.get("fp") == fingerprint(data)[:16]:
+        return at * 1000
     exp = oauth(data).get("expiresAt")
-    return exp - ACCESS_TOKEN_HOURS * 3600 * 1000 if exp else 0
+    return exp - ACCESS_TOKEN_HOURS * 3600 * 1000 if isinstance(exp, (int, float)) and exp else 0
 
 
 def owner_of(data, skip=""):
@@ -412,10 +480,18 @@ def plan_of(name):
 # ---------- locks ----------
 
 class DirLock:
-    """mkdir lock, the kind Claude Code uses (proper-lockfile): a directory older than `stale` seconds is dead."""
+    """
+    mkdir lock, the kind Claude Code uses (proper-lockfile): a directory whose mtime is older than `stale`
+    seconds is dead and may be taken over. Hold these briefly and touch() them during longer work. On exit the
+    lock is removed only if it is still the directory this process made, never one another process took over.
+    """
 
     def __init__(self, path, stale, wait=30.0):
-        self.path, self.stale, self.wait, self.held = path, stale, wait, False
+        self.path, self.stale, self.wait, self.held, self.ident = path, stale, wait, False, None
+
+    def _ident(self):
+        st = os.stat(self.path)
+        return st.st_dev, st.st_ino, getattr(st, "st_birthtime", None)
 
     def __enter__(self):
         end = time.time() + self.wait
@@ -423,6 +499,8 @@ class DirLock:
             try:
                 os.mkdir(self.path)
                 self.held = True
+                with contextlib.suppress(OSError):
+                    self.ident = self._ident()
                 return self
             except FileExistsError:
                 try:
@@ -435,21 +513,40 @@ class DirLock:
                 raise Fail(f"busy: {self.path} is held by another process; try again in a minute")
             time.sleep(0.25)
 
-    def __exit__(self, *exc):
+    def touch(self):
+        """Tell other processes the holder is alive (Claude Code updates its own locks every 5 s)."""
         if self.held:
-            try:
+            with contextlib.suppress(OSError):
+                os.utime(self.path)
+
+    def __exit__(self, *exc):
+        if not self.held:
+            return
+        self.held = False
+        with contextlib.suppress(OSError):
+            if self.ident is None or self._ident() == self.ident:
                 os.rmdir(self.path)
-            except OSError:
-                pass
 
 
 def store_lock():
     return DirLock(STORE_LOCK, stale=120)
 
 
-def claude_lock():
+@contextlib.contextmanager
+def claude_locks():
+    """
+    Claude Code's token renewal locks, in Claude Code's order: while held, no running session renews (and writes
+    back) a login. Take store_lock() before these, never after, so a wait for the store never holds them up.
+    """
     os.makedirs(CLAUDE_DIR, exist_ok=True)
-    return DirLock(CLAUDE_LOCK, stale=60)
+    with DirLock(CLAUDE_LOCK, stale=60) as current, DirLock(CLAUDE_LEGACY_LOCK, stale=60) as legacy:
+        yield current, legacy
+
+
+def storage_lock():
+    """Claude Code's lock around every write of the saved login (its secure storage), held for one write."""
+    os.makedirs(CLAUDE_DIR, exist_ok=True)
+    return DirLock(STORAGE_LOCK, stale=15, wait=20)
 
 
 # ---------- saving ----------
@@ -460,9 +557,11 @@ def keep_history(name):
         return
     make_private_dir(HISTORY)
     shutil.copy2(src, os.path.join(HISTORY, f"{name}.{stamp()}.credentials.json"))
-    old = sorted(glob.glob(os.path.join(HISTORY, f"{name}.*.credentials.json")))
+    # Exact name only: `work.*` would also match the copies of an account called `work.old`.
+    mine = re.compile(re.escape(name) + r"\.\d{8}-\d{6}(?:-\d{6})?\.credentials\.json\Z")
+    old = sorted(f for f in os.listdir(HISTORY) if mine.match(f))
     for f in old[:-KEEP]:
-        os.remove(f)
+        os.remove(os.path.join(HISTORY, f))
 
 
 def snapshot(name):
@@ -480,7 +579,8 @@ def snapshot(name):
         return True  # already up to date
     keep_history(name)
     write_text_atomic(slot(name, "credentials"), text)
-    write_json_atomic(slot(name, "account"), read_json(STATE, {}, strict=True).get("oauthAccount") or {})
+    acct = read_dict(STATE, strict=True).get("oauthAccount")
+    write_json_atomic(slot(name, "account"), acct if isinstance(acct, dict) else {})
     set_meta(name, dead="")
     return True
 
@@ -510,11 +610,40 @@ def park_unknown(saved_out):
 
 # ---------- renewal of inactive saved logins (opt-in) ----------
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect would carry a token to another address: treat it as an error instead."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+OPENER = urllib.request.build_opener(_NoRedirect)
+NETWORK_ERRORS = (urllib.error.URLError, http.client.HTTPException, OSError, ValueError)
+
+
 def post_json(url, body, timeout=30):
     req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
                                  headers={"Content-Type": "application/json", "User-Agent": PROG})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with OPENER.open(req, timeout=timeout) as r:
         return json.loads(r.read())
+
+
+def oauth_error(exc):
+    """The OAuth `error` code of an HTTP error reply, or "" when the body is not the token server's JSON."""
+    try:
+        body = json.loads(exc.read())
+    except (ValueError, OSError, AttributeError, http.client.HTTPException):
+        return ""
+    err = body.get("error") if isinstance(body, dict) else None
+    if isinstance(err, dict):
+        err = err.get("type")
+    return err if isinstance(err, str) else ""
+
+
+def network_reason(exc):
+    """A short reason for a failed request. Never the reply body, which could echo a token."""
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    return f"{type(exc).__name__}: {reason}"[:120]
 
 
 def refresh_one(name, force=False):
@@ -538,43 +667,53 @@ def refresh_one(name, force=False):
         body = {"grant_type": "refresh_token", "refresh_token": rt, "client_id": o.get("clientId") or CLIENT_ID,
                 "scope": " ".join(o.get("scopes") or DEFAULT_SCOPES)}
         try:
+            keep_history(name)  # before the request: once the server answers, the old pair is spent
+        except OSError as exc:
+            return f"FAILED: could not keep a history copy ({type(exc).__name__}); nothing was sent"
+        try:
             data = post_json(TOKEN_URL, body)
         except urllib.error.HTTPError as exc:
-            try:
-                code = json.loads(exc.read()).get("error", "")
-            except (ValueError, OSError, AttributeError):
-                code = ""
-            code = code if isinstance(code, str) else (code or {}).get("type", "")
-            if exc.code in (400, 401) and code in ("invalid_grant", "invalid_request", ""):
+            code = oauth_error(exc)
+            # Only the token server's own JSON answer proves the login dead; a proxy's error page does not.
+            if exc.code in (400, 401) and code in ("invalid_grant", "invalid_request"):
                 set_meta(name, dead=time.strftime("%Y-%m-%d %H:%M"))
                 return (f"FAILED: HTTP {exc.code} {code}. This saved login is dead (something renewed it after it "
                         f"was saved). Run: {PROG} add {name}")
-            return f"FAILED: HTTP {exc.code} {code}, saved copy unchanged; try later"
-        except (urllib.error.URLError, OSError, ValueError) as exc:
-            return f"FAILED: {type(exc).__name__}, saved copy unchanged; try later"
-        if not isinstance(data, dict) or not data.get("access_token") or not data.get("expires_in"):
+            return f"FAILED: HTTP {exc.code}{' ' + code if code else ''}, saved copy unchanged; try later"
+        except NETWORK_ERRORS as exc:
+            return f"FAILED: {network_reason(exc)}, saved copy unchanged; try later"
+        if not isinstance(data, dict) or not isinstance(data.get("access_token"), str) \
+                or not isinstance(data.get("expires_in"), (int, float)):
             return "FAILED: the reply had no access token or expiry, saved copy unchanged"
         now = time.time()
         new = dict(o)
         new["accessToken"] = data["access_token"]
-        new["refreshToken"] = data.get("refresh_token") or rt  # Claude Code keeps the old one when none comes back
+        new_rt = data.get("refresh_token")
+        new["refreshToken"] = new_rt if isinstance(new_rt, str) and new_rt else rt  # Claude Code keeps the old one
         new["expiresAt"] = int((now + float(data["expires_in"])) * 1000)
         if isinstance(data.get("refresh_token_expires_in"), (int, float)):
             new["refreshTokenExpiresAt"] = int((now + data["refresh_token_expires_in"]) * 1000)
         full["claudeAiOauth"] = new
-        keep_history(name)
         text = json.dumps(full, separators=(",", ":"), ensure_ascii=False)
         try:
             write_text_atomic(path, text)
         except OSError as exc:  # the old pair is already spent: keep the new one somewhere, never lose it
             rescue = os.path.join(STORE, f"rescue-{name}-{stamp()}.credentials.json")
-            write_text_atomic(rescue, text)
-            return f"FAILED to write the saved copy ({exc}); the new login is in {rescue}: copy it over {path}"
+            try:
+                write_text_atomic(rescue, text)
+            except OSError:
+                return (f"FAILED to write the saved copy or a rescue copy ({type(exc).__name__}); the renewed login "
+                        f"is lost. Run: {PROG} add {name}")
+            return (f"FAILED to write the saved copy ({type(exc).__name__}); the new login is in {rescue}: "
+                    f"copy it over {path}")
         rotated = new["refreshToken"] != rt
         acct = data.get("account")
-        got = (acct.get("email_address") or "") if isinstance(acct, dict) else ""
-        set_meta(name, refreshed_at=int(now), fp=fingerprint(full)[:16], dead="")
-    drop_usage_cache(name)
+        got = acct.get("email_address") if isinstance(acct, dict) else ""
+        got = got if isinstance(got, str) else ""
+        with contextlib.suppress(OSError):
+            set_meta(name, refreshed_at=int(now), fp=fingerprint(full)[:16], dead="")
+    with contextlib.suppress(OSError):
+        drop_usage_cache(name)
     who = f", ! the server says this login is {got}" if got and not same_email(got, email_of(name)) else ""
     return (f"renewed, access token until {when(new['expiresAt'])}{who}"
             f"{', refresh token rotated' if rotated else ', same refresh token'}"
@@ -584,16 +723,18 @@ def refresh_one(name, force=False):
 # ---------- usage ----------
 
 def drop_usage_cache(name):
-    c = read_json(USAGE_CACHE, {})
+    c = read_dict(USAGE_CACHE)
     if c.pop(name, None) is not None:
         write_json_atomic(USAGE_CACHE, c)
 
 
 def usage(name):
     """(reading, note). reading has five_hour / seven_day dicts, or None. note says how old or why unknown."""
-    cache = read_json(USAGE_CACHE, {})
+    cache = read_dict(USAGE_CACHE)
     hit = cache.get(name)
-    if hit and time.time() - hit.get("at", 0) < CACHE_SECONDS:
+    if not (isinstance(hit, dict) and isinstance(hit.get("at"), (int, float)) and isinstance(hit.get("data"), dict)):
+        hit = None
+    if hit and time.time() - hit["at"] < CACHE_SECONDS:
         return hit["data"], ""
     live = is_live(name)
     o = oauth(live_data() if live else slot_data(name))
@@ -608,18 +749,19 @@ def usage(name):
                                                      "anthropic-beta": "oauth-2025-04-20",
                                                      "User-Agent": PROG})
     try:
-        with urllib.request.urlopen(req, timeout=15) as r:
+        with OPENER.open(req, timeout=15) as r:
             d = json.loads(r.read())
     except urllib.error.HTTPError as exc:
         return old, f"usage HTTP {exc.code}" + stale
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        return old, f"usage failed: {type(exc).__name__}" + stale
+    except NETWORK_ERRORS as exc:
+        return old, f"usage failed: {network_reason(exc)}" + stale
     if not isinstance(d, dict):
         return old, "usage reply not understood" + stale
     keep = {k: d.get(k) for k in ("five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet")}
-    cache = read_json(USAGE_CACHE, {})
+    cache = read_dict(USAGE_CACHE)
     cache[name] = {"at": time.time(), "data": keep}
-    write_json_atomic(USAGE_CACHE, cache)
+    with contextlib.suppress(OSError):
+        write_json_atomic(USAGE_CACHE, cache)
     return keep, ""
 
 
@@ -669,14 +811,17 @@ def warn_running():
     if TEST_HOME:
         return
     try:
+        # errors="replace": a non-English Windows prints tasklist in its OEM code page, which UTF-8 mode
+        # (the default from Python 3.15, or PYTHONUTF8=1) cannot decode.
         if os.name == "nt":
             out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq claude.exe", "/FO", "CSV", "/NH"],
-                                 capture_output=True, text=True, timeout=10).stdout
+                                 capture_output=True, text=True, errors="replace", timeout=10).stdout or ""
             n = sum(1 for line in out.splitlines() if line.lower().startswith('"claude.exe"'))
         else:
-            out = subprocess.run(["pgrep", "-x", "claude"], capture_output=True, text=True, timeout=10).stdout
+            out = subprocess.run(["pgrep", "-x", "claude"], capture_output=True, text=True, errors="replace",
+                                 timeout=10).stdout or ""
             n = len(out.split())
-    except (OSError, subprocess.SubprocessError):
+    except Exception:  # only a hint: never let it fail a switch that already happened
         return
     if n:
         print(f"{n} claude processes running: after a switch, /exit and `claude -c` in each open session.")
@@ -700,16 +845,37 @@ def warn_token_override():
               f"saved login, so switching has no effect until you remove it.")
 
 
+def credential_manager_in_use():
+    """
+    Claude Code 2.1.316 can keep the login in Windows Credential Manager instead of .credentials.json: when
+    CLAUDE_CODE_FORCE_WINDOWS_CREDMAN is set, or when Anthropic turns the tengu_windows_credman feature on (cached
+    in ~/.claude.json). It then deletes the file after its first write, and swapping the file does nothing.
+    """
+    if os.name != "nt" and not TEST_HOME:
+        return False
+    forced = os.environ.get("CLAUDE_CODE_FORCE_WINDOWS_CREDMAN", "").strip().lower()
+    if forced and forced not in ("0", "false", "no", "off"):
+        return True
+    features = read_dict(STATE).get("cachedGrowthBookFeatures")
+    return isinstance(features, dict) and features.get("tengu_windows_credman") is True
+
+
 def check_profile():
     if os.environ.get("CLAUDE_CONFIG_DIR") or os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR"):
         raise Fail(f"CLAUDE_CONFIG_DIR is set. {PROG} manages the default profile (~/.claude) only; unset it "
                    f"in this shell and try again.")
+    if credential_manager_in_use():
+        raise Fail(f"Claude Code keeps this login in Windows Credential Manager (CLAUDE_CODE_FORCE_WINDOWS_CREDMAN "
+                   f"or the tengu_windows_credman setting in ~/.claude.json). {PROG} only handles "
+                   f"~/.claude/.credentials.json, so it stops here instead of breaking your login. Your saved "
+                   f"copies are unchanged. Please report it: {ISSUES}")
 
 
 # ---------- commands ----------
 
 def cmd_save(name):
     check_name(name)
+    check_case(name)
     email = current_email()
     data = live_data(fresh=True)
     if not email or not fingerprint(data):
@@ -739,16 +905,20 @@ def cmd_use(name):
         save_outgoing()
         print(f"claude already uses {name} ({email_of(name)})")
         return
-    # Hold Claude Code's refresh lock: no running session can renew (and write back) the outgoing login mid-swap.
-    with claude_lock(), store_lock():
-        saved_out = snapshot(cur) if owns_state(cur) else False
-        park_unknown(saved_out)
-        with DirLock(STATE_LOCK, stale=10):
-            state = read_json(STATE, {}, strict=True)
+    # The store first, then Claude Code's locks in its own order, held only for the swap: while they are held no
+    # running session renews (and writes back) the outgoing login, or writes the saved login at all.
+    with store_lock():
+        with claude_locks() as renewal, storage_lock(), DirLock(STATE_LOCK, stale=10):
+            saved_out = snapshot(cur) if owns_state(cur) else False
+            park_unknown(saved_out)
+            for lock in renewal:
+                lock.touch()
+            state = read_dict(STATE, strict=True)
+            incoming = read_dict(slot(name, "account"))
             LIVE.write(read_text(slot(name, "credentials")))
             if os.path.exists(STATE):
                 private_copy(STATE, os.path.join(STORE, "claude.json.bak"))
-            state["oauthAccount"] = read_json(slot(name, "account"), {})
+            state["oauthAccount"] = incoming
             write_json_atomic(STATE, state, private=False)
         set_active(name)
     print(f"claude now uses {name} ({current_email()}). Open sessions: /exit, then claude -c")
@@ -760,15 +930,17 @@ def cmd_use(name):
 
 def cmd_add(name):
     check_name(name)
+    check_case(name)
     warn_token_override()
-    with claude_lock():
-        park_unknown(save_outgoing())
-        text = LIVE.read(fresh=True)
-        if text:
-            parked = os.path.join(STORE, f"parked-for-login-{stamp()}.credentials.json")
-            write_text_atomic(parked, text)
-            LIVE.remove()
     with store_lock():
+        with claude_locks(), storage_lock():
+            cur = active()
+            park_unknown(snapshot(cur) if owns_state(cur) else False)
+            text = LIVE.read(fresh=True)
+            if text:
+                parked = os.path.join(STORE, f"parked-for-login-{stamp()}.credentials.json")
+                write_text_atomic(parked, text)
+                LIVE.remove()
         load_accounts()
         ACCTS.setdefault(name, "")
         save_accounts()
@@ -821,16 +993,28 @@ def cmd_refresh(names, force=False, quiet=False):
     return results
 
 
-def cmd_keepalive():
-    cmd_sync(quiet=True)
-    results = cmd_refresh([], quiet=True)
-    line = time.strftime("%Y-%m-%d %H:%M:%S ") + ("; ".join(f"{n}: {r}" for n, r in results.items()) or "nothing saved")
-    with open(LOG, "a", encoding="utf-8", newline="\n") as fh:
+def append_log(line):
+    fd = os.open(LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8", newline="\n") as fh:
         fh.write(line + "\n")
     lines = (read_text(LOG) or "").splitlines()
     if len(lines) > 500:
         write_text_atomic(LOG, "\n".join(lines[-300:]) + "\n")
-    return 1 if any(r.startswith("FAILED") for r in results.values()) else 0
+
+
+def cmd_keepalive():
+    """Runs unattended, so every outcome, failures included, goes to the log."""
+    try:
+        cmd_sync(quiet=True)
+        results = cmd_refresh([], quiet=True)
+        text = "; ".join(f"{n}: {r}" for n, r in results.items()) or "nothing saved"
+        code = 1 if any(r.startswith("FAILED") for r in results.values()) else 0
+    except Fail as exc:
+        text, code = f"ERROR: {exc}", 1
+    except Exception as exc:  # the messages hold no tokens: tokens never reach an exception in this file
+        text, code = f"ERROR: {type(exc).__name__}: {exc}", 1
+    append_log(time.strftime("%Y-%m-%d %H:%M:%S ") + text)
+    return code
 
 
 def cmd_list():
@@ -867,7 +1051,7 @@ def cmd_list():
         stxt = "  ?" if ss is None else f"{ss:3.0f}%"
         flag = "!" if (w or 0) >= NEAR else " "
         wcol = f"{bar(w, 10)} {wtxt}{flag} {reset_at((d or {}).get('seven_day')):>9}" if d else "unknown"
-        scol = f"{bar(ss, 6)} {stxt}  {reset_at((d or {}).get('five_hour')):>9}" if d else ""
+        scol = f"{bar(ss, 6)} {stxt} {reset_at((d or {}).get('five_hour')):>9}" if d else ""
         ends_ms = o.get("refreshTokenExpiresAt") or 0
         print(f"{mark} {n[:12]:12}  {e[:24]:24}  {plan_of(n)[:7]:7}  {wcol:26}  {scol:21}  "
               f"{when(refreshed_at(n, data)):11}  {when(ends_ms, '%m-%d')}")
@@ -877,7 +1061,7 @@ def cmd_list():
             notes.append(f"{n}: saved copy behind the live login ({PROG} sync)")
         if not saved(n):
             notes.append(f"{n}: active but NOT SAVED: {PROG} save {n}")
-        dead = (m.get(n) or {}).get("dead")
+        dead = meta_of(n, m).get("dead")
         if dead:
             notes.append(f"{n}: DEAD since {dead}: {PROG} add {n}")
         if ends_ms and ends_ms / 1000 - time.time() < END_WARN_DAYS * 86400:

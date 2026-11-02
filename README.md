@@ -9,14 +9,15 @@ CLAUDE ACCOUNTS   active: work (me@work.example)
 
    name          email                     plan     weekly use (resets)         5-hour use (resets)    renewed      ends
    ------------  ------------------------  -------  --------------------------  ---------------------  -----------  -----
->> work          me@work.example           Max 20x  #######...  71%   Sun 09:00  ###...  48%      17:00  10-30 12:10  11-24
-   personal      me@home.example           Max 5x   ##........  18%   Tue 21:00  ......   0%      19:40  10-30 09:02  11-19
+>> work          me@work.example           Max 20x  #######...  71%  Sun 09:00  ###...  48%     17:00  10-30 12:10  11-24
+   personal      me@home.example           Max 5x   ##........  18%  Tue 21:00  ......   0%     19:40  10-30 09:02  11-19
 
 Most weekly room: personal (18% used)  ->  claude-switch use personal  or  claude-switch auto
 Commands: claude-switch use NAME | auto | add NAME | save NAME | sync | refresh | help
 ```
 
-One Python file, standard library only, for Windows, Linux and macOS.
+One Python file, standard library only. For Windows and Linux; macOS support is written and tested against a fake
+Keychain, not yet on a real Mac. Unofficial: not made or supported by Anthropic.
 
 ## The problem
 
@@ -38,11 +39,13 @@ on Tuesday and Claude Code asks you to log in again.
 
 claude-switch works around this:
 
-- **Every command saves the outgoing login first.** `use`, `list`, `sync` and the rest store the active account's
-  newest login before doing anything else, so your saved copy is never older than your last command.
-- **It holds Claude Code's own locks while it swaps.** Claude Code takes `~/.claude/.oauth_refresh.lock` before it
-  renews and `~/.claude.json.lock` before it writes its state. claude-switch takes the same locks, so no running
-  session renews the outgoing login halfway through a switch.
+- **Most commands save the outgoing login first.** `use`, `list`, `auto`, `add`, `sync`, `refresh` and `keepalive`
+  store the active account's newest login before anything else, so your saved copy is never older than your last
+  command.
+- **It holds Claude Code's own locks while it swaps.** Claude Code takes `~/.claude/.oauth_refresh.lock` and
+  `~/.claude.lock` before it renews a login, `~/.claude/.storage-write.lock` before it writes one, and
+  `~/.claude.json.lock` before it writes its state. claude-switch takes the same locks in the same order, only for the
+  moment of the swap, so no running session renews or rewrites the login halfway through a switch.
 - **It refuses to file one account's login under another name.** It compares logins by a SHA-256 hash of the refresh
   token and by the email Claude Code records.
 - **It keeps the last 3 copies of each account** in `~/.claude-switch/history/`.
@@ -57,7 +60,11 @@ Claude Code keeps the login in one place per user:
 | Platform | Login | Account details |
 |---|---|---|
 | Windows, Linux | `~/.claude/.credentials.json` | `oauthAccount` in `~/.claude.json` |
-| macOS | Keychain item `Claude Code-credentials` (account: your user name), with `~/.claude/.credentials.json` as fallback | `oauthAccount` in `~/.claude.json` |
+| macOS | Keychain item `Claude Code-credentials` (account `claude-code-user`; older Claude Code versions used your user name, which claude-switch also reads), with `~/.claude/.credentials.json` as fallback | `oauthAccount` in `~/.claude.json` |
+
+Claude Code 2.1.316 can also keep the Windows login in Windows Credential Manager, when
+`CLAUDE_CODE_FORCE_WINDOWS_CREDMAN` is set or when Anthropic turns that on for your account. claude-switch does not
+handle that store yet: it notices and stops before it changes anything.
 
 claude-switch saves both parts per account in `~/.claude-switch/` and swaps them in on `use`. It changes nothing
 else in `~/.claude.json`, so projects, history and settings stay shared.
@@ -71,16 +78,19 @@ else in `~/.claude.json`, so projects, history and settings stay shared.
 - **[claude-swap](https://github.com/realiti4/claude-swap)** by realiti4 is a larger, feature-rich switcher (TUI,
   menu bar, automatic switching). claude-switch is smaller: one file, no dependencies, a usage table, and opt-in
   renewal of the accounts you are not using. We borrowed ideas from claude-swap and thank its author: the macOS
-  Keychain handling (service and account names, writing through `security -i` in hex so the token never shows in
-  the process list) follows its implementation, and so does the rule never to log out before adding an account.
+  Keychain handling (service and account names, writing through `security -i` in hex so the token stays out of
+  the process list unless the login is longer than about 4 KB) follows its implementation, and so does the rule
+  never to log out before adding an account.
 
 ## Install
 
 Python 3.9 or newer.
 
 ```
-pipx install git+https://github.com/Abubakr-Alsheikh/claude-account-switch
+pipx install git+https://github.com/Abubakr-Alsheikh/claude-account-switch@v0.2.0
 ```
+
+The PyPI package named `claude-switch` is a different project. Install from GitHub as shown.
 
 Or copy `claude_switch.py` anywhere and run `python claude_switch.py`. It has no dependencies.
 
@@ -121,7 +131,8 @@ In a running session, type `/exit` and then `claude -c` to continue the same con
 | `claude-switch init powershell\|bash\|zsh` | Print shell shortcuts (see below). |
 | `claude-switch help` | All commands with the add steps. |
 
-Account names are free-form: 1 to 32 letters, digits, `.`, `-` or `_`.
+Account names are free-form: 1 to 32 letters, digits, `.`, `-` or `_`, starting with a letter or digit. Names that
+differ only in case (`work`, `Work`) count as one name, because Windows and macOS file names ignore case.
 
 ## Add or repair an account
 
@@ -146,8 +157,9 @@ Repair the account with the steps above before then.
 An inactive account's saved access token expires after about 8 hours. Its usage then shows as unknown, and
 `auto` skips it.
 
-`claude-switch refresh` renews those saved logins with the same request Claude Code sends:
-`POST https://platform.claude.com/v1/oauth/token` with `grant_type=refresh_token` and Claude Code's public client id.
+`claude-switch refresh` renews those saved logins at the endpoint and with the fields Claude Code uses, identified by
+the User-Agent `claude-switch`: `POST https://platform.claude.com/v1/oauth/token` with `grant_type=refresh_token` and
+Claude Code's public client id.
 It never renews the active login, because your running sessions own that one. A renewal rotates the refresh token
 and claude-switch stores the new one right away (and keeps the previous copy in `history/`).
 
@@ -156,7 +168,8 @@ and claude-switch stores the new one right away (and keeps the previous copy in 
 `keepalive`.
 
 Usage readings come from `GET https://api.anthropic.com/api/oauth/usage`, the read-only endpoint behind Claude
-Code's `/usage` screen, called with each account's own access token. Readings are cached for 2 minutes.
+Code's `/usage` screen, called with each account's own access token, including the accounts you are not using.
+Readings are cached for 2 minutes.
 
 ### Scheduling keepalive
 
@@ -231,7 +244,8 @@ old session renews afterwards, the saved copy of that account is now dead: `list
 
 ## Platform support
 
-- **Windows, Linux:** tested.
+- **Windows:** the author's daily use, with Claude Code 2.1.316. CI runs the tests too.
+- **Linux:** CI with a fake profile, a fake token server and Python 3.9 to 3.15.
 - **macOS:** uses the login Keychain through Apple's `/usr/bin/security`. Writes are read back and checked; a locked
   Keychain (for example over SSH) stops the command with a clear message instead of falling back. CI runs the
   Keychain code against a fake `security` tool on every platform. The author has not tested it on a real Mac yet;
@@ -247,10 +261,12 @@ All in `~/.claude-switch/` (folder mode 0700, files 0600 on Linux and macOS):
 |---|---|
 | `accounts.json` | `{"name": "email"}` |
 | `NAME.credentials.json`, `NAME.account.json` | the saved login and account details |
-| `history/` | the last 3 copies of each login |
+| `history/` | the last 3 copies of each login; copies stay after `remove` |
 | `active.txt`, `meta.json`, `usage-cache.json` | which name is active, renewal dates, usage readings |
 | `parked-*.credentials.json` | logins set aside by `add` or because no name matched; delete them once you no longer need them |
-| `keepalive.log` | one line per keepalive run |
+| `rescue-*.credentials.json` | a renewed login that could not be written to its usual file; copy it over that file |
+| `removed/` | the files of accounts you removed |
+| `keepalive.log` | one line per keepalive run, failures included |
 | `claude.json.bak` | `~/.claude.json` as it was before the last switch |
 
 ## Troubleshooting
@@ -266,8 +282,34 @@ All in `~/.claude-switch/` (folder mode 0700, files 0600 on Linux and macOS):
 | `is OTHER's saved login, not NAME's` | `~/.claude.json` and the login disagree. `claude-switch use OTHER` puts them back in line. |
 | `SAME LOGIN AS ...` | Two names hold one login. Repair one of them. |
 | `CLAUDE_CODE_OAUTH_TOKEN is set` | That variable overrides every login. Remove it from your shell and your user environment. |
-| `busy: ... is held by another process` | Claude Code is renewing right now. Try again in a minute. A crashed process's lock expires by itself. |
+| `busy: ... is held by another process` | Claude Code is renewing or writing the login right now. Try again in a minute. A crashed process's lock expires by itself. |
+| `differs from the saved account ... only in case` | Use the existing name as written in `list`, or pick another name. |
+| `keeps this login in Windows Credential Manager` | Claude Code moved its Windows login out of the file claude-switch swaps. claude-switch stopped without changing anything. Please open an issue. |
 | macOS: `could not read the login from the macOS Keychain` | Unlock the login keychain (`security unlock-keychain`), then retry. |
+
+## What leaves your machine
+
+claude-switch talks to two Anthropic addresses over HTTPS, identifies itself with the User-Agent `claude-switch`, and
+follows no redirects:
+
+- `GET https://api.anthropic.com/api/oauth/usage` from `list`, `auto` and `refresh`, with each saved account's access
+  token, at most once per account every 2 minutes.
+- `POST https://platform.claude.com/v1/oauth/token` from `refresh`, `keepalive` and `auto --refresh` only, with that
+  account's saved refresh token.
+
+`use`, `add`, `save`, `sync`, `remove`, `init` and `help` make no network calls. Anthropic can see requests for
+several accounts coming from one machine. No telemetry.
+
+## Uninstall
+
+1. `claude-switch use NAME` for the account you want to keep. Claude Code stays on it.
+2. Delete any keepalive task: `schtasks /Delete /TN "claude-switch keepalive" /F`, your `crontab -e` line, or
+   `launchctl unload` plus the plist.
+3. `pipx uninstall claude-account-switch`, and remove the shortcut line from your shell profile.
+4. Delete `~/.claude-switch/`. It holds working copies of your other logins.
+
+claude-switch changes only the login (`~/.claude/.credentials.json` or the Keychain item) and `oauthAccount` in
+`~/.claude.json`. `~/.claude-switch/claude.json.bak` holds `~/.claude.json` from before the last switch.
 
 ## Terms and risk
 
@@ -276,6 +318,7 @@ All in `~/.claude-switch/` (folder mode 0700, files 0600 on Linux and macOS):
   Code's public OAuth client id. Anthropic can change any of these without notice, and the tool may break.
 - `refresh`, `keepalive` and `auto --refresh` send token requests from a script that is not Claude Code. They are off
   unless you run them. Decide for yourself whether that fits your use.
+- `list` and `auto` read usage for accounts you are not using, from a script that is not Claude Code.
 - You must follow [Anthropic's terms](https://www.anthropic.com/legal) and usage policies for every account you use.
 - It is meant for one person moving between their own subscriptions. Do not share logins or tokens, and do not
   resell or pool access.
@@ -287,8 +330,9 @@ All in `~/.claude-switch/` (folder mode 0700, files 0600 on Linux and macOS):
 python -m unittest discover -s tests -v
 ```
 
-The tests build a fake home folder (`CLAUDE_SWITCH_HOME`), a local fake token and usage server that rotates refresh
-tokens like the real one, and a fake `security` tool. They never touch your real profile or the network.
+The tests build a fake home folder (`CLAUDE_SWITCH_TEST_HOME`), a local fake token and usage server that rotates
+refresh tokens like the real one, and a fake `security` tool. They never touch your real profile, your Keychain or
+the network. See [CONTRIBUTING.md](CONTRIBUTING.md) before you send a change.
 
 ## Maintainer
 

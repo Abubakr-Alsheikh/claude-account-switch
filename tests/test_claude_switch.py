@@ -2,7 +2,7 @@
 
     python -m unittest discover -s tests -v
 
-Each test class builds a fake home in a temp folder (CLAUDE_SWITCH_HOME) and talks to a local fake OAuth server that
+Each test class builds a fake home in a temp folder (CLAUDE_SWITCH_TEST_HOME) and talks to a local fake OAuth server that
 rotates refresh tokens the way the real one does (each refresh token works once).
 """
 import datetime
@@ -31,6 +31,9 @@ class FakeServer:
     def __init__(self):
         self.rt, self.at, self.n, self.posts = {}, {}, 0, []
         self.usage = {"alpha@example.com": 20.0, "beta@example.com": 70.0}
+        self.post_mode = ""        # "html401": answer the next token requests like a proxy's error page
+        self.redirect_usage = False  # answer usage requests with a redirect to /elsewhere
+        self.elsewhere_hits = 0
         server = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -48,6 +51,13 @@ class FakeServer:
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 server.posts.append({k: v for k, v in body.items() if k != "refresh_token"})
+                if server.post_mode == "html401":
+                    page = b"<html><body>Proxy authentication required</body></html>"
+                    self.send_response(401)
+                    self.send_header("Content-Type", "text/html")
+                    self.send_header("Content-Length", str(len(page)))
+                    self.end_headers()
+                    return self.wfile.write(page)
                 acct = server.rt.pop(body.get("refresh_token"), None)  # single use
                 if (self.headers["Content-Type"] != "application/json" or body.get("grant_type") != "refresh_token"
                         or not acct):
@@ -59,6 +69,15 @@ class FakeServer:
                                  "token_type": "Bearer"})
 
             def do_GET(self):
+                if self.path.startswith("/elsewhere"):
+                    server.elsewhere_hits += 1
+                    return self.reply(200, {})
+                if server.redirect_usage:
+                    self.send_response(302)
+                    self.send_header("Location", server.url + "/elsewhere")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return None
                 tok = (self.headers.get("Authorization") or "").replace("Bearer ", "")
                 acct = server.at.get(tok)
                 if not acct or self.headers.get("anthropic-beta") != "oauth-2025-04-20":
@@ -123,7 +142,7 @@ class Profile:
     def env(self, **extra):
         env = {k: v for k, v in os.environ.items()
                if k not in ("CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN")}
-        env.update(CLAUDE_SWITCH_HOME=self.home, CLAUDE_SWITCH_TOKEN_URL=self.server.url + "/v1/oauth/token",
+        env.update(CLAUDE_SWITCH_TEST_HOME=self.home, CLAUDE_SWITCH_TOKEN_URL=self.server.url + "/v1/oauth/token",
                    CLAUDE_SWITCH_USAGE_URL=self.server.url + "/api/oauth/usage", CLAUDE_SWITCH_BACKEND=self.backend,
                    CLAUDE_SWITCH_SECURITY=FAKE_SECURITY, USER="tester", PYTHONIOENCODING="utf-8")
         env.update(extra)
@@ -336,7 +355,7 @@ class KeychainTest(unittest.TestCase):
     def setUp(self):
         self.p = Profile(self.server, backend="keychain")
         self.db = os.path.join(self.p.home, "fake-keychain.json")
-        self.key = "Claude Code-credentials|tester"
+        self.key = "Claude Code-credentials|claude-code-user"
 
     def tearDown(self):
         shutil.rmtree(self.p.home, ignore_errors=True)
@@ -388,12 +407,184 @@ class KeychainTest(unittest.TestCase):
         out, _ = p.run("save", "alpha")
         self.assertIn("saved alpha", out, "with no Keychain item, the credentials file is read")
 
+    def test_older_claude_code_item_under_the_login_name(self):
+        """Claude Code before 2.1 filed the item under $USER: read it, and write back to the same item."""
+        p = self.p
+        legacy = "Claude Code-credentials|tester"
+        data = self.server.creds(EMAILS["alpha"])
+        wjson(self.db, {legacy: json.dumps(data)})
+        wjson(p.state, {"oauthAccount": {"emailAddress": EMAILS["alpha"]}})
+        p.run("save", "alpha")
+        self.assertEqual(rjson(p.slot("alpha")), data, "save reads the older item")
+        p.run("add", "beta")
+        self.assertEqual(self.keychain(), {}, "add deletes the item under either account")
+        self.kc_login(EMAILS["beta"])
+        p.run("save", "beta")
+        p.run("use", "alpha")
+        self.assertEqual(json.loads(self.keychain()[self.key]), data, "use writes where Claude Code 2.1 reads")
+
     def test_locked_keychain_stops_clearly(self):
         p = self.p
         self.kc_login(EMAILS["alpha"])
         out, code = p.run("save", "alpha", ok=False, FAKE_SECURITY_FAIL="36")
         self.assertTrue(code != 0 and "Unlock the login keychain" in out, "a locked Keychain gives a clear error")
         self.assertFalse(os.path.exists(p.slot("alpha")), "nothing saved from a failed read")
+
+
+class ReviewFixTest(unittest.TestCase):
+    """Fixes from the review before 0.2.0. Each test gets its own fake home."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = FakeServer()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.close()
+
+    def setUp(self):
+        self.server.post_mode, self.server.redirect_usage = "", False
+        self.p = Profile(self.server)
+        self.addCleanup(shutil.rmtree, self.p.home, True)
+
+    def two_accounts(self):
+        """alpha saved and inactive, beta live."""
+        p = self.p
+        p.login(EMAILS["alpha"])
+        p.run("save", "alpha")
+        p.run("add", "beta")
+        p.login(EMAILS["beta"])
+        p.run("save", "beta")
+        return p
+
+    def history(self):
+        folder = os.path.join(self.p.store, "history")
+        return sorted(os.listdir(folder)) if os.path.isdir(folder) else []
+
+    def test_credential_manager_stops_every_command(self):
+        p = self.p
+        p.login(EMAILS["alpha"])
+        out, code = p.run("list", ok=False, CLAUDE_CODE_FORCE_WINDOWS_CREDMAN="1")
+        self.assertTrue(code != 0 and "Windows Credential Manager" in out, out)
+        st = rjson(p.state)
+        st["cachedGrowthBookFeatures"] = {"tengu_windows_credman": True}
+        wjson(p.state, st)
+        out, code = p.run("save", "alpha", ok=False)
+        self.assertTrue(code != 0 and "Windows Credential Manager" in out, out)
+        self.assertFalse(os.path.exists(p.slot("alpha")), "nothing saved")
+        st["cachedGrowthBookFeatures"] = {"tengu_windows_credman": False}
+        wjson(p.state, st)
+        p.run("save", "alpha")
+
+    def test_names_that_differ_only_in_case_are_refused(self):
+        p = self.p
+        p.login(EMAILS["alpha"])
+        p.run("save", "work")
+        for cmd in ("add", "save"):
+            out, code = p.run(cmd, "Work", ok=False)
+            self.assertTrue(code != 0 and "only in case" in out, f"{cmd}: {out}")
+        self.assertEqual(list(rjson(os.path.join(p.store, "accounts.json"))), ["work"])
+
+    def test_history_of_a_dotted_name_stays_apart(self):
+        p = self.p
+        p.login(EMAILS["alpha"])
+        p.run("save", "work")
+        p.run("add", "work.old")
+        p.login(EMAILS["beta"])
+        p.run("save", "work.old")
+        p.run("use", "work")
+        for _ in range(4):
+            p.run("refresh", "work.old", "--force")
+        p.run("refresh", "work.old", "--force")
+        old_copies = [f for f in self.history() if f.startswith("work.old.")]
+        self.assertEqual(len(old_copies), 3, self.history())
+        p.run("use", "work.old")
+        p.run("refresh", "work", "--force")
+        self.assertEqual(len([f for f in self.history() if f.startswith("work.old.")]), 3,
+                         "renewing work leaves work.old's copies alone")
+        self.assertEqual(len([f for f in self.history() if f.startswith("work.2")]), 1, self.history())
+
+    def test_history_failure_sends_nothing(self):
+        p = self.two_accounts()
+        before, posts = rjson(p.slot("alpha")), len(self.server.posts)
+        shutil.rmtree(os.path.join(p.store, "history"), ignore_errors=True)
+        with open(os.path.join(p.store, "history"), "w") as fh:  # a file where the folder should be
+            fh.write("x")
+        out, _ = p.run("refresh", "alpha", "--force")
+        self.assertIn("could not keep a history copy", out)
+        self.assertEqual(len(self.server.posts), posts, "no token request after the backup failed")
+        self.assertEqual(rjson(p.slot("alpha")), before, "saved copy unchanged")
+        self.assertIn(before["claudeAiOauth"]["refreshToken"], self.server.rt, "the saved login is still alive")
+
+    def test_proxy_error_page_does_not_mark_a_login_dead(self):
+        p = self.two_accounts()
+        self.server.post_mode = "html401"
+        out, _ = p.run("refresh", "alpha", "--force")
+        self.assertIn("FAILED: HTTP 401, saved copy unchanged", out)
+        out, _ = p.run("list")
+        self.assertNotIn("DEAD", out)
+
+    def test_usage_redirect_is_not_followed(self):
+        p = self.two_accounts()
+        if os.path.exists(os.path.join(p.store, "usage-cache.json")):
+            os.remove(os.path.join(p.store, "usage-cache.json"))
+        self.server.redirect_usage = True
+        out, _ = p.run("list")
+        self.assertIn("usage HTTP 302", out)
+        self.assertEqual(self.server.elsewhere_hits, 0, "the token never went to the redirect target")
+
+    def test_broken_json_files_give_no_traceback(self):
+        p = self.two_accounts()
+        for name in ("usage-cache.json", "meta.json"):
+            with open(os.path.join(p.store, name), "w") as fh:
+                fh.write("[1, 2]")
+        out, _ = p.run("list")
+        self.assertNotIn("Traceback", out)
+        with open(p.state, "w") as fh:
+            fh.write("[]")
+        out, code = p.run("use", "alpha", ok=False)
+        self.assertTrue(code != 0 and "must hold a JSON object" in out and "Traceback" not in out, out)
+
+    def test_use_takes_and_releases_claude_codes_locks(self):
+        p = self.two_accounts()
+        p.run("use", "alpha")
+        for path in (os.path.join(p.home, ".claude", ".oauth_refresh.lock"), os.path.join(p.home, ".claude.lock"),
+                     os.path.join(p.home, ".claude", ".storage-write.lock"), p.state + ".lock"):
+            self.assertFalse(os.path.exists(path), path)
+
+    def test_a_live_storage_lock_makes_use_wait_then_stop(self):
+        """A Claude Code session writing its login keeps the lock fresh; use must wait, not take it over."""
+        p = self.two_accounts()
+        lock = os.path.join(p.home, ".claude", ".storage-write.lock")
+        os.mkdir(lock)
+        done = threading.Event()
+
+        def keep_fresh():
+            while not done.wait(2):
+                os.utime(lock)
+
+        threading.Thread(target=keep_fresh, daemon=True).start()
+        self.addCleanup(done.set)
+        start = time.time()
+        out, code = p.run("use", "alpha", ok=False)
+        self.assertTrue(code != 0 and "busy" in out, out)
+        self.assertGreater(time.time() - start, 15, "use waited for the lock")
+        self.assertEqual(p.email(), EMAILS["beta"], "nothing switched")
+        self.assertTrue(os.path.isdir(lock), "the other holder's lock is left alone")
+
+    @unittest.skipIf(os.name == "nt", "file modes are a POSIX matter")
+    def test_keepalive_log_is_private(self):
+        p = self.two_accounts()
+        p.run("keepalive")
+        self.assertEqual(os.stat(os.path.join(p.store, "keepalive.log")).st_mode & 0o777, 0o600)
+
+    def test_test_home_never_picks_the_keychain_by_itself(self):
+        p = self.p
+        p.login(EMAILS["alpha"])
+        out, _ = p.run("help", CLAUDE_SWITCH_BACKEND="")
+        self.assertIn(".credentials.json", out, "a test home uses the file backend unless told otherwise")
+        out, code = p.run("list", ok=False, CLAUDE_SWITCH_BACKEND="keychain", CLAUDE_SWITCH_SECURITY="")
+        self.assertTrue(code != 0 and "needs CLAUDE_SWITCH_SECURITY" in out, out)
 
 
 class CliTest(unittest.TestCase):

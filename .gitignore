@@ -11,3 +11,6 @@ venv/
 *.credentials.json
 .credentials.json
 .claude-switch/
+
+# owner notes, never committed
+/private/

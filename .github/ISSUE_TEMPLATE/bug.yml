@@ -1,0 +1,34 @@
+name: Bug report
+description: Something did not work as the README says
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Never paste files from `~/.claude-switch/` or `~/.claude/.credentials.json`.** They hold your logins.
+        Command output and `keepalive.log` hold no tokens, but they do show your account emails; remove them if you prefer.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The command you ran, what it printed, and what you expected.
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: Windows 11, Ubuntu 24.04, macOS 15
+    validations:
+      required: true
+  - type: input
+    id: switch-version
+    attributes:
+      label: claude-switch --version
+    validations:
+      required: true
+  - type: input
+    id: claude-version
+    attributes:
+      label: claude --version
+    validations:
+      required: true
